@@ -95,7 +95,12 @@ impl ApplicationHandler for GuiApp {
         {
             match app.window_event(event) {
                 Reply::Continue => (),
-                Reply::Quit => event_loop.exit(),
+                Reply::Quit => {
+                    // Drop the wgpu resources before the window is destroyed to avoid driver crashes.
+                    self.app = None;
+                    self.window = None;
+                    event_loop.exit();
+                }
                 Reply::Redraw => {
                     if app.redraw() {
                         window.request_redraw();
