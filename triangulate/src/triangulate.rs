@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 
-use glm::{DMat4, DVec3, DVec4, U32Vec3};
+use glm::{DMat4, DVec2, DVec3, DVec4, U32Vec3};
 use log::{debug, error, info, warn};
 use nalgebra_glm as glm;
 
@@ -351,14 +351,18 @@ fn shell(s: &StepFile, c: Shell, mesh: &mut Mesh, stats: &mut Stats) {
 fn open_shell(s: &StepFile, c: OpenShell, mesh: &mut Mesh, stats: &mut Stats) {
     let cs = s.entity(c).expect("Could not get OpenShell");
     for face in &cs.cfs_faces {
-        // Check if this face is actually an AdvancedFace before casting
-        if s.entity::<AdvancedFace_>(face.cast()).is_some() {
-            if let Err(err) = advanced_face(s, face.cast(), mesh, stats) {
-                error!("Failed to triangulate {:?}: {}", s[*face], err);
+        match &s[*face] {
+            Entity::AdvancedFace(_) => {
+                if let Err(err) = advanced_face(s, face.cast(), mesh, stats) {
+                    error!("Failed to triangulate {:?}: {}", s[*face], err);
+                }
             }
-        } else {
-            // Skip faces that aren't AdvancedFace
-            debug!("Skipping non-AdvancedFace: {:?}", s[*face]);
+            Entity::FaceSurface(_) => {
+                if let Err(err) = face_surface(s, face.cast(), mesh, stats) {
+                    error!("Failed to triangulate {:?}: {}", s[*face], err);
+                }
+            }
+            _ => debug!("Skipping unsupported face: {:?}", s[*face]),
         }
     }
     stats.num_shells += 1;
@@ -367,17 +371,38 @@ fn open_shell(s: &StepFile, c: OpenShell, mesh: &mut Mesh, stats: &mut Stats) {
 fn closed_shell(s: &StepFile, c: ClosedShell, mesh: &mut Mesh, stats: &mut Stats) {
     let cs = s.entity(c).expect("Could not get ClosedShell");
     for face in &cs.cfs_faces {
-        // Check if this face is actually an AdvancedFace before casting
-        if s.entity::<AdvancedFace_>(face.cast()).is_some() {
-            if let Err(err) = advanced_face(s, face.cast(), mesh, stats) {
-                error!("Failed to triangulate {:?}: {}", s[*face], err);
+        match &s[*face] {
+            Entity::AdvancedFace(_) => {
+                if let Err(err) = advanced_face(s, face.cast(), mesh, stats) {
+                    error!("Failed to triangulate {:?}: {}", s[*face], err);
+                }
             }
-        } else {
-            // Skip faces that aren't AdvancedFace
-            debug!("Skipping non-AdvancedFace: {:?}", s[*face]);
+            Entity::FaceSurface(_) => {
+                if let Err(err) = face_surface(s, face.cast(), mesh, stats) {
+                    error!("Failed to triangulate {:?}: {}", s[*face], err);
+                }
+            }
+            _ => debug!("Skipping unsupported face: {:?}", s[*face]),
         }
     }
     stats.num_shells += 1;
+}
+
+fn face_surface(
+    s: &StepFile,
+    f: FaceSurface,
+    mesh: &mut Mesh,
+    stats: &mut Stats,
+) -> Result<(), Error> {
+    let face = s.entity(f).ok_or(Error::UnknownSurfaceType)?;
+    triangulate_face(
+        s,
+        &face.bounds,
+        face.face_geometry,
+        face.same_sense,
+        mesh,
+        stats,
+    )
 }
 
 fn advanced_face(
@@ -387,10 +412,29 @@ fn advanced_face(
     stats: &mut Stats,
 ) -> Result<(), Error> {
     let face = s.entity(f).ok_or(Error::UnknownSurfaceType)?;
+    triangulate_face(
+        s,
+        &face.bounds,
+        face.face_geometry,
+        face.same_sense,
+        mesh,
+        stats,
+    )
+}
+
+fn triangulate_face(
+    s: &StepFile,
+    bounds: &[FaceBound],
+    face_geometry: ap214::Surface,
+    same_sense: bool,
+    mesh: &mut Mesh,
+    stats: &mut Stats,
+) -> Result<(), Error> {
     stats.num_faces += 1;
+    let face_geom_id = face_geometry.0;
 
     // Grab the surface, returning early if it's unimplemented
-    let mut surf = surface(s, face.face_geometry)?;
+    let mut surf = surface(s, face_geometry)?;
 
     // This is the starting point at which we insert new vertices
     let offset = mesh.verts.len();
@@ -400,12 +444,12 @@ fn advanced_face(
     let mut edges = Vec::new();
     let v_start = mesh.verts.len();
     let mut num_pts = 0;
-    for b in &face.bounds {
+    for b in bounds {
         let bound_contours = face_bound(s, *b)?;
 
         match bound_contours.len() {
             // We should always have non-zero items in the contour
-            0 => panic!("Got empty contours for {:?}", face),
+            0 => panic!("Got empty contours for {:?}", face_geom_id),
 
             // Special case for a single-vertex point, which shows up in
             // cones: we push it as a Steiner point, but without any
@@ -448,6 +492,30 @@ fn advanced_face(
         }
     }
 
+    if edges.is_empty() {
+        if let Some(default_loop) = surface_default_loop(&surf) {
+            let start = num_pts;
+            for pt in default_loop {
+                edges.push((num_pts, num_pts + 1));
+                mesh.verts.push(mesh::Vertex {
+                    pos: pt,
+                    norm: DVec3::zeros(),
+                    color: DVec3::new(0.0, 0.0, 0.0),
+                });
+                num_pts += 1;
+            }
+            // Remove the duplicated final point and close the loop
+            num_pts -= 1;
+            mesh.verts.pop();
+            edges.pop();
+            edges.last_mut().unwrap().1 = start;
+        } else {
+            return Err(Error::UnknownSurfaceType);
+        }
+    }
+
+    debug_assert_eq!(num_pts, mesh.verts.len() - v_start);
+
     // We inject Stiner points based on the surface type to improve curvature,
     // e.g. for spherical sections.  However, we don't want triagulation to
     // _fail_ due to these points, so if that happens, we nuke the point (by
@@ -477,7 +545,7 @@ fn advanced_face(
                 }
                 Err(e) => {
                     if SAVE_DEBUG_SVGS {
-                        let filename = format!("err{}.svg", face.face_geometry.0);
+                        let filename = format!("err{}.svg", face_geom_id);
                         t.save_debug_svg(&filename)
                             .expect("Could not save debug SVG");
                     }
@@ -493,7 +561,7 @@ fn advanced_face(
                 let b = (b + offset) as u32;
                 let c = (c + offset) as u32;
                 mesh.triangles.push(Triangle {
-                    verts: if face.same_sense {
+                    verts: if same_sense {
                         U32Vec3::new(a, b, c)
                     } else {
                         U32Vec3::new(a, c, b)
@@ -502,31 +570,65 @@ fn advanced_face(
             }
         }
         Ok(Err(e)) => {
-            error!(
-                "Got error while triangulating {}: {:?}",
-                face.face_geometry.0, e
-            );
+            error!("Got error while triangulating {}: {:?}", face_geom_id, e);
             stats.num_errors += 1;
         }
         Err(e) => {
-            error!(
-                "Got panic while triangulating {}: {:?}",
-                face.face_geometry.0, e
-            );
+            error!("Got panic while triangulating {}: {:?}", face_geom_id, e);
             if SAVE_PANIC_SVGS {
-                let filename = format!("panic{}.svg", face.face_geometry.0);
+                let filename = format!("panic{}.svg", face_geom_id);
                 cdt::save_debug_panic(&pts, &edges, &filename).expect("Could not save debug SVG");
             }
             stats.num_panics += 1;
         }
     }
     // Flip normals of new vertices, depending on the same_sense flag
-    if !face.same_sense {
+    if !same_sense {
         for v in &mut mesh.verts[v_start..] {
             v.norm = -v.norm;
         }
     }
     Ok(())
+}
+
+fn surface_default_loop(surf: &Surface) -> Option<Vec<DVec3>> {
+    match surf {
+        Surface::Bspline(s) => Some(bspline_surface_corners(&s.surf)),
+        Surface::Nurbs(s) => Some(nurbs_surface_corners(&s.surf)),
+        _ => None,
+    }
+}
+
+fn bspline_surface_corners(surf: &nurbs::NdBsplineSurface<3>) -> Vec<DVec3> {
+    let corners = [
+        DVec2::new(surf.min_u(), surf.min_v()),
+        DVec2::new(surf.max_u(), surf.min_v()),
+        DVec2::new(surf.max_u(), surf.max_v()),
+        DVec2::new(surf.min_u(), surf.max_v()),
+        DVec2::new(surf.min_u(), surf.min_v()),
+    ];
+
+    corners
+        .iter()
+        .map(|uv| surf.surface_point(*uv))
+        .map(|p| DVec3::new(p[0], p[1], p[2]))
+        .collect()
+}
+
+fn nurbs_surface_corners(surf: &nurbs::NdBsplineSurface<4>) -> Vec<DVec3> {
+    let corners = [
+        DVec2::new(surf.min_u(), surf.min_v()),
+        DVec2::new(surf.max_u(), surf.min_v()),
+        DVec2::new(surf.max_u(), surf.max_v()),
+        DVec2::new(surf.min_u(), surf.max_v()),
+        DVec2::new(surf.min_u(), surf.min_v()),
+    ];
+
+    corners
+        .iter()
+        .map(|uv| surf.surface_point(*uv))
+        .map(|p| DVec3::new(p[0] / p[3], p[1] / p[3], p[2] / p[3]))
+        .collect()
 }
 
 fn surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
@@ -599,9 +701,11 @@ fn surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
 
             let control_points_list = control_points_2d(s, &b.control_points_list);
 
+            let u_closed = b.u_closed.0.unwrap_or(false);
+            let v_closed = b.v_closed.0.unwrap_or(false);
             let surf = BsplineSurface::new(
-                !b.u_closed.0.unwrap(),
-                !b.v_closed.0.unwrap(),
+                !u_closed,
+                !v_closed,
                 u_knot_vec,
                 v_knot_vec,
                 control_points_list,
@@ -658,9 +762,11 @@ fn surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
                 })
                 .collect();
 
+            let u_closed = bspline.u_closed.0.unwrap_or(false);
+            let v_closed = bspline.v_closed.0.unwrap_or(false);
             let surf = NurbsSurface::new(
-                !bspline.u_closed.0.unwrap(),
-                !bspline.v_closed.0.unwrap(),
+                !u_closed,
+                !v_closed,
                 u_knot_vec,
                 v_knot_vec,
                 control_points_list,
@@ -699,7 +805,7 @@ fn face_bound(s: &StepFile, b: FaceBound) -> Result<Vec<DVec3>, Error> {
         Entity::VertexLoop(v) => {
             // This is an "edge loop" with a single vertex, which is
             // used for cones and not really anything else.
-            Ok(vec![vertex_point(s, v.loop_vertex)])
+            Ok(vec![vertex_point(s, v.loop_vertex)?])
         }
         e => panic!("{:?} is not an EdgeLoop", e),
     }
@@ -729,8 +835,8 @@ fn edge_curve(s: &StepFile, e: EdgeCurve, orientation: bool) -> Result<Vec<DVec3
     } else {
         (edge_curve.edge_end, edge_curve.edge_start)
     };
-    let u = vertex_point(s, start);
-    let v = vertex_point(s, end);
+    let u = vertex_point(s, start)?;
+    let v = vertex_point(s, end)?;
     Ok(curve.build(u, v))
 }
 
@@ -765,9 +871,10 @@ fn curve(
             )
         }
         Entity::BSplineCurveWithKnots(c) => {
-            if c.closed_curve.0 != Some(false) {
+            let closed_curve = c.closed_curve.0.unwrap_or(false);
+            if closed_curve {
                 return Err(Error::ClosedCurve);
-            } else if c.self_intersect.0 != Some(false) {
+            } else if c.self_intersect.0.unwrap_or(false) {
                 return Err(Error::SelfIntersectingCurve);
             }
 
@@ -785,8 +892,7 @@ fn curve(
                 &multiplicities,
             );
 
-            let curve =
-                nurbs::BsplineCurve::new(!c.closed_curve.0.unwrap(), knot_vec, control_points_list);
+            let curve = nurbs::BsplineCurve::new(!closed_curve, knot_vec, control_points_list);
             Curve::BsplineCurveWithKnots(SampledCurve::new(curve))
         }
         Entity::ComplexEntity(v) if v.len() == 2 => {
@@ -820,11 +926,8 @@ fn curve(
                 .map(|(p, w)| DVec4::new(p.x * w, p.y * w, p.z * w, *w))
                 .collect();
 
-            let curve = nurbs::NurbsCurve::new(
-                !bspline.closed_curve.0.unwrap(),
-                knot_vec,
-                control_points_list,
-            );
+            let closed_curve = bspline.closed_curve.0.unwrap_or(false);
+            let curve = nurbs::NurbsCurve::new(!closed_curve, knot_vec, control_points_list);
             Curve::NurbsCurve(SampledCurve::new(curve))
         }
         Entity::SurfaceCurve(v) => curve(s, edge_curve, v.curve_3d, orientation)?,
@@ -838,12 +941,21 @@ fn curve(
     })
 }
 
-fn vertex_point(s: &StepFile, v: Vertex) -> DVec3 {
-    cartesian_point(
-        s,
-        s.entity(v.cast::<VertexPoint_>())
-            .expect("Could not get VertexPoint")
-            .vertex_geometry
-            .cast(),
-    )
+fn vertex_point(s: &StepFile, v: Vertex) -> Result<DVec3, Error> {
+    let vertex = s
+        .entity(v.cast::<VertexPoint_>())
+        .expect("Could not get VertexPoint");
+
+    match &s[vertex.vertex_geometry] {
+        Entity::CartesianPoint(_) => Ok(cartesian_point(s, vertex.vertex_geometry.cast())),
+        Entity::PointOnSurface(p) => {
+            let surf = surface(s, p.basis_surface)?;
+            surf.raise(DVec2::new(p.point_parameter_u.0, p.point_parameter_v.0))
+                .ok_or(Error::CouldNotLower)
+        }
+        other => {
+            warn!("Unsupported vertex geometry: {:?}", other);
+            Err(Error::UnknownPointType)
+        }
+    }
 }

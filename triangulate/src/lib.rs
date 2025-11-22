@@ -26,4 +26,7 @@ pub enum Error {
 
     #[error("Self-intersecting NURBS and b-spline curves are not implemented")]
     SelfIntersectingCurve,
+
+    #[error("Unknown point representation")]
+    UnknownPointType,
 }
