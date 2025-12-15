@@ -9,7 +9,7 @@ default = ["rayon"]
 
 [dependencies]
 arrayvec = "0.7"
-fast-float = "0.2"
+fast-float = { version = "0.2", package = "fast-float2" }
 log = "0.4"
 memchr = "2.7"
 nom = "7"
